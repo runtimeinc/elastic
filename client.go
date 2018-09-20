@@ -113,6 +113,7 @@ type Client struct {
 
 	mu                        sync.RWMutex    // guards the next block
 	urls                      []string        // set of URLs passed initially to the client
+	loadBalancerURL           string          // URL for a load balancer fronting the nodes in the cluster
 	running                   bool            // true if the client's background processes are running
 	errorlog                  Logger          // error log for critical messages
 	infolog                   Logger          // information log for e.g. response times
@@ -332,11 +333,15 @@ func DialContext(ctx context.Context, options ...ClientOptionFunc) (*Client, err
 		}
 	}
 
-	// Use a default URL and normalize them
-	if len(c.urls) == 0 {
-		c.urls = []string{DefaultURL}
+	if c.loadBalancerURL != "" {
+		c.urls = canonicalize(c.loadBalancerURL)
+	} else {
+		// Use a default URL and normalize them
+		if len(c.urls) == 0 {
+			c.urls = []string{DefaultURL}
+		}
+		c.urls = canonicalize(c.urls...)
 	}
-	c.urls = canonicalize(c.urls...)
 
 	// If the URLs have auth info, use them here as an alternative to SetBasicAuth
 	if !c.basicAuth {
@@ -500,6 +505,17 @@ func SetURL(urls ...string) ClientOptionFunc {
 	}
 }
 
+// SetLoadBalancerURL set the URL for the load balancer in front of the
+// es nodes. Sniffing and health checks will be disabled.
+func SetLoadBalancerURL(url string) ClientOptionFunc {
+	return func(c *Client) error {
+		c.loadBalancerURL = url
+		c.snifferEnabled = false
+		c.healthcheckEnabled = false
+		return nil
+	}
+}
+
 // SetScheme sets the HTTP scheme to look for when sniffing (http or https).
 // This is http by default.
 func SetScheme(scheme string) ClientOptionFunc {
@@ -512,6 +528,9 @@ func SetScheme(scheme string) ClientOptionFunc {
 // SetSniff enables or disables the sniffer (enabled by default).
 func SetSniff(enabled bool) ClientOptionFunc {
 	return func(c *Client) error {
+		if enabled && c.loadBalancerURL != "" {
+			return errors.New("Sniffing is not supported with a load balancer")
+		}
 		c.snifferEnabled = enabled
 		return nil
 	}
@@ -572,6 +591,9 @@ func SetSnifferCallback(f SnifferCallback) ClientOptionFunc {
 // SetHealthcheck enables or disables healthchecks (enabled by default).
 func SetHealthcheck(enabled bool) ClientOptionFunc {
 	return func(c *Client) error {
+		if enabled && c.loadBalancerURL != "" {
+			return errors.New("Health checks not supported with a load balancer")
+		}
 		c.healthcheckEnabled = enabled
 		return nil
 	}
@@ -1175,6 +1197,11 @@ func (c *Client) startupHealthcheck(parentCtx context.Context, timeout time.Dura
 
 // next returns the next available connection, or ErrNoClient.
 func (c *Client) next() (*conn, error) {
+	if c.loadBalancerURL != "" {
+		// No client side load balancing. We're talking to a load balancer.
+		return c.conns[0], nil
+	}
+
 	// We do round-robin here.
 	// TODO(oe) This should be a pluggable strategy, like the Selector in the official clients.
 	c.connsMu.Lock()
@@ -1348,12 +1375,16 @@ func (c *Client) PerformRequest(ctx context.Context, opt PerformRequestOptions) 
 			wait, ok, rerr := retrier.Retry(ctx, n, (*http.Request)(req), res, err)
 			if rerr != nil {
 				c.errorf("elastic: %s is dead", conn.URL())
-				conn.MarkAsDead()
+				if c.loadBalancerURL == "" {
+					conn.MarkAsDead()
+				}
 				return nil, rerr
 			}
 			if !ok {
 				c.errorf("elastic: %s is dead", conn.URL())
-				conn.MarkAsDead()
+				if c.loadBalancerURL == "" {
+					conn.MarkAsDead()
+				}
 				return nil, err
 			}
 			retried = true
